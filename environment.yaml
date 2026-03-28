@@ -1,0 +1,15 @@
+name: brca_analysis
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - polars>=1.0
+  - numpy>=1.23
+  - sqlalchemy>=2.0
+  - pytest>=7.0
+  - pip
+  - pip:
+      - fastexcel>=0.9
+      - pyliftover>=0.4
+      - combat>=0.3.3
