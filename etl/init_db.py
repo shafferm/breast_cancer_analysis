@@ -14,7 +14,7 @@ from sqlalchemy import text
 
 import etl._bootstrap  # noqa: F401
 from config.settings import DB_PATH, DDL_PATH
-from etl.db import get_connection, execute_script
+from etl.db import get_connection, execute_script, dispose_engine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -29,7 +29,13 @@ def init_db(force: bool = False) -> None:
     if DB_PATH.exists():
         if force:
             logger.warning(f"--force: removing existing database at {DB_PATH}")
+            dispose_engine(DB_PATH)
             DB_PATH.unlink()
+            for suffix in ("-wal", "-shm"):
+                sidecar = DB_PATH.parent / (DB_PATH.name + suffix)
+                if sidecar.exists():
+                    sidecar.unlink()
+                    logger.info(f"  Removed stale {sidecar.name}")
         else:
             logger.info(f"Database already exists at {DB_PATH}")
             logger.info("Use --force to drop and recreate.")

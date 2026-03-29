@@ -16,7 +16,6 @@ import etl._bootstrap  # noqa: F401
 from config.settings import (
     TCGA_CDR_FILE, TCGA_CLINICAL_PATIENT, TCGA_CLINICAL_DRUG,
     METABRIC_CLINICAL_PATIENT, METABRIC_CLINICAL_SAMPLE,
-    MENOPAUSE_AGE_CUTOFF,
 )
 from etl.db import get_connection, bulk_insert, log_harmonization
 from etl.harmonize import (
@@ -44,7 +43,7 @@ def load_tcga_clinical_cdr(conn: Connection) -> tuple[list[dict[str, Any]], list
 
     df = pl.read_excel(TCGA_CDR_FILE, sheet_name="TCGA-CDR")
     df = df.filter(pl.col("type") == "BRCA")
-    logger.info(f"  {len(df)} BRCA cases in CDR")
+    logger.info(f"  [TCGA-BRCA] {len(df):,} cases in CDR")
 
     patients, tumors = [], []
     for r in df.to_dicts():
@@ -75,7 +74,7 @@ def load_tcga_clinical_cdr(conn: Connection) -> tuple[list[dict[str, Any]], list
             integrative_cluster=None, nottingham_prognostic_index=None,
         ))
     tx = _load_tcga_treatments({p["patient_id"] for p in patients})
-    logger.info(f"  TCGA: {len(patients)} patients, {len(tumors)} tumors, {len(tx)} treatments")
+    logger.info(f"  [TCGA-BRCA] {len(patients):,} patients, {len(tumors):,} tumors, {len(tx):,} treatments")
     return patients, tumors, tx
 
 
@@ -121,7 +120,7 @@ def load_tcga_clinical_biotab(conn: Connection) -> tuple[list[dict[str, Any]], l
             nottingham_prognostic_index=compute_npi(sz, gr, ln),
         ))
     tx = _load_tcga_treatments({p["patient_id"] for p in patients})
-    logger.info(f"  TCGA biotab: {len(patients)} patients, {len(tumors)} tumors, {len(tx)} treatments")
+    logger.info(f"  [TCGA-BRCA] {len(patients):,} patients, {len(tumors):,} tumors, {len(tx):,} treatments")
     return patients, tumors, tx
 
 
@@ -160,7 +159,7 @@ def load_metabric_clinical(conn: Connection) -> tuple[list[dict[str, Any]], list
         df = df_p.join(df_s, on="PATIENT_ID", how="left", suffix="_s")
     else:
         df = df_p
-    logger.info(f"  {len(df)} rows")
+    logger.info(f"  [METABRIC] {len(df):,} rows")
 
     patients, tumors, treatments = [], [], []
     txc = 0
@@ -221,7 +220,7 @@ def load_metabric_clinical(conn: Connection) -> tuple[list[dict[str, Any]], list
                     treatment_name=None, received=1 if tv.upper() in ("YES", "1", "Y") else 0,
                 ))
 
-    logger.info(f"  METABRIC: {len(patients)} patients, {len(tumors)} tumors, {len(treatments)} treatments")
+    logger.info(f"  [METABRIC] {len(patients):,} patients, {len(tumors):,} tumors, {len(treatments):,} treatments")
     return patients, tumors, treatments
 
 
@@ -229,7 +228,7 @@ def load_metabric_clinical(conn: Connection) -> tuple[list[dict[str, Any]], list
 
 def load_clinical() -> None:
     with get_connection() as conn:
-        for loader, study in [(load_tcga_clinical_cdr, "TCGA-BRCA"), (load_metabric_clinical, "METABRIC")]:
+        for loader, _study in [(load_tcga_clinical_cdr, "TCGA-BRCA"), (load_metabric_clinical, "METABRIC")]:
             ps, ts, txs = loader(conn)
             if ps:
                 bulk_insert(conn, "patients", ps)
@@ -244,7 +243,7 @@ def load_clinical() -> None:
 
         for t in ["patients", "tumors", "treatments"]:
             n = conn.execute(text(f"SELECT count(*) FROM {t}")).scalar()
-            logger.info(f"  {t}: {n} rows")
+            logger.info(f"  {t}: {n:,} rows")
 
 
 if __name__ == "__main__":

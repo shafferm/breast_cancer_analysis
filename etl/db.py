@@ -2,6 +2,9 @@
 Database connection helpers for the BRCA harmonized ETL pipeline.
 
 Uses SQLAlchemy Core (no ORM) for connection management and raw SQL execution.
+
+TODO: Migrate from SQLite to DuckDB for better analytical query performance
+      and native Polars integration (direct DataFrame ingestion).
 """
 
 import logging
@@ -35,6 +38,14 @@ def get_engine(db_path: Path = DB_PATH) -> Engine:
 
         _engines[db_path] = engine
     return _engines[db_path]
+
+
+def dispose_engine(db_path: Path = DB_PATH) -> None:
+    """Dispose and remove a cached engine (call before deleting a DB file)."""
+    key = str(db_path)
+    engine = _engines.pop(key, None)
+    if engine is not None:
+        engine.dispose()
 
 
 @contextmanager
@@ -90,6 +101,44 @@ def log_harmonization(conn: Connection, table_name: str, study_source: str,
         {"table_name": table_name, "study_source": study_source, "field_name": field_name,
          "transformation": transformation, "source_field": source_field, "notes": notes},
     )
+
+
+def bulk_executemany(conn: Connection, sql: str, rows: list[tuple],
+                     batch_size: int = 50_000, label: str = "") -> int:
+    """Fast bulk insert using raw DBAPI executemany (SQLite-optimized)."""
+    raw = conn.connection.driver_connection
+    total = 0
+    n = len(rows)
+    for i in range(0, n, batch_size):
+        raw.executemany(sql, rows[i:i + batch_size])
+        total += len(rows[i:i + batch_size])
+        if total % (batch_size * 20) == 0 and total < n:
+            logger.info(f"  {label}{total:,} / {n:,} rows inserted")
+    return total
+
+
+def drop_indexes(conn: Connection, table: str) -> list[str]:
+    """Drop all non-PK indexes on a table. Returns DDL to recreate them."""
+    rows = conn.execute(text(
+        "SELECT name, sql FROM sqlite_master "
+        "WHERE type='index' AND tbl_name=:t AND sql IS NOT NULL"
+    ), {"t": table}).fetchall()
+    ddl = [r[1] for r in rows]
+    for r in rows:
+        conn.execute(text(f"DROP INDEX {r[0]}"))
+    if ddl:
+        conn.commit()
+        logger.info(f"  Dropped {len(ddl)} indexes on {table} for bulk load")
+    return ddl
+
+
+def recreate_indexes(conn: Connection, ddl_statements: list[str]) -> None:
+    """Recreate indexes from saved DDL statements."""
+    for stmt in ddl_statements:
+        conn.execute(text(stmt))
+    if ddl_statements:
+        conn.commit()
+        logger.info(f"  Recreated {len(ddl_statements)} indexes")
 
 
 def table_row_count(conn: Connection, table: str) -> int:

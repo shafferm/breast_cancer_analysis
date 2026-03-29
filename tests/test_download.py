@@ -20,7 +20,7 @@ from etl.download_data import (
     CDR_FILENAME,
     CDR_URL,
     _extract_tarball,
-    _has_files,
+    _has_expected_files,
     _validate,
     download_cdr,
     download_metabric,
@@ -29,23 +29,36 @@ from etl.download_data import (
 
 
 # ---------------------------------------------------------------------------
-# _has_files
+# _has_expected_files
 # ---------------------------------------------------------------------------
 
-class TestHasFiles:
+class TestHasExpectedFiles:
     def test_nonexistent_dir(self, tmp_path):
-        assert _has_files(tmp_path / "no_such_dir") is False
+        assert _has_expected_files(tmp_path / "no_such_dir", ["a.txt"]) is False
 
     def test_empty_dir(self, tmp_path):
         d = tmp_path / "empty"
         d.mkdir()
-        assert _has_files(d) is False
+        assert _has_expected_files(d, ["a.txt"]) is False
 
-    def test_dir_with_file(self, tmp_path):
-        d = tmp_path / "nonempty"
+    def test_all_present(self, tmp_path):
+        d = tmp_path / "full"
         d.mkdir()
-        (d / "file.txt").write_text("hello")
-        assert _has_files(d) is True
+        (d / "a.txt").write_text("x")
+        (d / "b.txt").write_text("x")
+        assert _has_expected_files(d, ["a.txt", "b.txt"]) is True
+
+    def test_partial_returns_false(self, tmp_path):
+        d = tmp_path / "partial"
+        d.mkdir()
+        (d / "a.txt").write_text("x")
+        assert _has_expected_files(d, ["a.txt", "b.txt"]) is False
+
+    def test_unrelated_file_not_enough(self, tmp_path):
+        d = tmp_path / "wrong"
+        d.mkdir()
+        (d / "unrelated.xlsx").write_text("x")
+        assert _has_expected_files(d, ["data_mutations.txt"]) is False
 
 
 # ---------------------------------------------------------------------------
@@ -204,10 +217,21 @@ class TestDownloadCdr:
 # ---------------------------------------------------------------------------
 
 class TestDownloadIdempotency:
-    def test_metabric_skips_if_has_files(self, tmp_path, monkeypatch):
+    def _create_metabric_files(self, metabric_dir):
+        from etl.download_data import METABRIC_EXPECTED
+        metabric_dir.mkdir(exist_ok=True)
+        for f in METABRIC_EXPECTED:
+            (metabric_dir / f).write_text("existing")
+
+    def _create_tcga_files(self, tcga_dir):
+        from etl.download_data import TCGA_EXPECTED
+        tcga_dir.mkdir(exist_ok=True)
+        for f in TCGA_EXPECTED:
+            (tcga_dir / f).write_text("existing")
+
+    def test_metabric_skips_if_all_expected(self, tmp_path, monkeypatch):
         metabric_dir = tmp_path / "metabric"
-        metabric_dir.mkdir()
-        (metabric_dir / "data_clinical_patient.txt").write_text("existing")
+        self._create_metabric_files(metabric_dir)
         monkeypatch.setattr("etl.download_data.METABRIC_DIR", metabric_dir)
 
         calls = []
@@ -217,7 +241,8 @@ class TestDownloadIdempotency:
         download_metabric(force=False)
         assert len(calls) == 0
 
-    def test_metabric_force_downloads(self, tmp_path, monkeypatch):
+    def test_metabric_downloads_if_partial(self, tmp_path, monkeypatch):
+        """Only some expected files present — should re-download."""
         metabric_dir = tmp_path / "metabric"
         metabric_dir.mkdir()
         (metabric_dir / "data_clinical_patient.txt").write_text("existing")
@@ -229,21 +254,51 @@ class TestDownloadIdempotency:
         monkeypatch.setattr("etl.download_data._extract_tarball",
                             lambda *a, **kw: None)
 
+        download_metabric(force=False)
+        assert len(calls) == 1
+
+    def test_metabric_force_downloads(self, tmp_path, monkeypatch):
+        metabric_dir = tmp_path / "metabric"
+        self._create_metabric_files(metabric_dir)
+        monkeypatch.setattr("etl.download_data.METABRIC_DIR", metabric_dir)
+
+        calls = []
+        monkeypatch.setattr("etl.download_data._download",
+                            lambda *a, **kw: calls.append(a))
+        monkeypatch.setattr("etl.download_data._extract_tarball",
+                            lambda *a, **kw: None)
+
         download_metabric(force=True)
         assert len(calls) == 1
 
-    def test_tcga_skips_if_has_files(self, tmp_path, monkeypatch):
+    def test_tcga_skips_if_all_expected(self, tmp_path, monkeypatch):
         tcga_dir = tmp_path / "tcga"
-        tcga_dir.mkdir()
-        (tcga_dir / "data_mutations.txt").write_text("existing")
+        self._create_tcga_files(tcga_dir)
         monkeypatch.setattr("etl.download_data.TCGA_DIR", tcga_dir)
 
         calls = []
         monkeypatch.setattr("etl.download_data._download",
                             lambda *a, **kw: calls.append(a))
-        # Also patch download_cdr to avoid network calls
         monkeypatch.setattr("etl.download_data.download_cdr",
                             lambda force=False: None)
 
         download_tcga(force=False)
         assert len(calls) == 0
+
+    def test_tcga_downloads_if_only_cdr_present(self, tmp_path, monkeypatch):
+        """CDR file present but tarball files missing — must not skip tarball."""
+        tcga_dir = tmp_path / "tcga"
+        tcga_dir.mkdir()
+        (tcga_dir / CDR_FILENAME).write_bytes(b"x" * 60_000)
+        monkeypatch.setattr("etl.download_data.TCGA_DIR", tcga_dir)
+
+        calls = []
+        monkeypatch.setattr("etl.download_data._download",
+                            lambda *a, **kw: calls.append(a))
+        monkeypatch.setattr("etl.download_data._extract_tarball",
+                            lambda *a, **kw: None)
+        monkeypatch.setattr("etl.download_data.download_cdr",
+                            lambda force=False: None)
+
+        download_tcga(force=False)
+        assert len(calls) == 1  # tarball download should proceed

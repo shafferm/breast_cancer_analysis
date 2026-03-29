@@ -15,7 +15,6 @@ Called automatically as step 0 of etl.run_all.
 
 import argparse
 import logging
-import os
 import tarfile
 import tempfile
 import urllib.request
@@ -32,8 +31,8 @@ logger = logging.getLogger(__name__)
 # Download URLs
 # ---------------------------------------------------------------------------
 
-TCGA_URL = "https://cbioportal-datahub.s3.amazonaws.com/brca_tcga.tar.gz"
-METABRIC_URL = "https://cbioportal-datahub.s3.amazonaws.com/brca_metabric.tar.gz"
+TCGA_URL = "https://datahub.assets.cbioportal.org/brca_tcga.tar.gz"
+METABRIC_URL = "https://datahub.assets.cbioportal.org/brca_metabric.tar.gz"
 
 CDR_URL = "https://api.gdc.cancer.gov/data/1b5f413e-a8d1-4d10-92eb-7c4ae739ed81"
 CDR_FALLBACK = (
@@ -64,9 +63,9 @@ METABRIC_EXPECTED = [
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _has_files(directory: Path) -> bool:
-    """True if the directory exists and contains at least one file."""
-    return directory.is_dir() and any(directory.iterdir())
+def _has_expected_files(directory: Path, expected: list[str]) -> bool:
+    """True if directory contains all expected files from tarball extraction."""
+    return directory.is_dir() and all((directory / f).exists() for f in expected)
 
 
 def _make_reporthook(label: str) -> Callable:
@@ -133,8 +132,8 @@ def _validate(directory: Path, expected_files: list[str], label: str) -> None:
 def download_metabric(force: bool = False) -> None:
     """Download and extract the METABRIC cBioPortal tarball."""
     logger.info("METABRIC download:")
-    if not force and _has_files(METABRIC_DIR):
-        logger.info(f"  {METABRIC_DIR} already has files — skipping.")
+    if not force and _has_expected_files(METABRIC_DIR, METABRIC_EXPECTED):
+        logger.info(f"  {METABRIC_DIR} already has expected files — skipping.")
         logger.info("  Pass --force to re-download.")
         return
 
@@ -155,8 +154,8 @@ def download_metabric(force: bool = False) -> None:
 def download_tcga(force: bool = False) -> None:
     """Download and extract the TCGA-BRCA cBioPortal tarball, then fetch the CDR file."""
     logger.info("TCGA-BRCA download:")
-    if not force and _has_files(TCGA_DIR):
-        logger.info(f"  {TCGA_DIR} already has files — skipping tarball.")
+    if not force and _has_expected_files(TCGA_DIR, TCGA_EXPECTED):
+        logger.info(f"  {TCGA_DIR} already has expected files — skipping tarball.")
         logger.info("  Pass --force to re-download.")
     else:
         TCGA_DIR.mkdir(parents=True, exist_ok=True)

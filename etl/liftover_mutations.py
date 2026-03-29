@@ -161,7 +161,7 @@ def liftover_mutations(dry_run: bool = False) -> None:
                 failed += 1
 
             if (i + 1) % 5000 == 0:
-                logger.info(f"  Processed {i+1:,}/{total:,} (lifted: {lifted:,}, failed: {failed:,})")
+                logger.info(f"  Processed {i+1:,} / {total:,} (lifted: {lifted:,}, failed: {failed:,})")
 
         if not dry_run:
             conn.commit()
@@ -169,7 +169,7 @@ def liftover_mutations(dry_run: bool = False) -> None:
             log_harmonization(
                 conn, "mutations", "METABRIC", "start_position",
                 f"Lifted {lifted:,}/{total:,} mutations from GRCh37 to GRCh38 "
-                f"using pyliftover (chain: {CHAIN_ID}). "
+                f"using pyliftover (chain: hg19ToHg38.over.chain.gz). "
                 f"{failed:,} variants unmappable.",
                 "start_position, end_position, chromosome",
                 f"Unmappable variants flagged with reference_genome='GRCh37_UNMAPPED'. "

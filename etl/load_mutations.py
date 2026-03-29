@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 def _read_maf(path: Path) -> pl.DataFrame:
     df = pl.read_csv(path, separator="\t", comment_prefix="#", infer_schema_length=0)
-    logger.info(f"  Read {len(df)} rows from {path.name}")
+    logger.info(f"  Read {len(df):,} rows from {path.name}")
     return df
 
 
@@ -49,7 +49,7 @@ VALID_VTYPES = {"SNP", "INS", "DEL", "DNP", "TNP", "ONP"}
 def load_tcga_mutations(conn: Connection) -> list[dict[str, Any]]:
     logger.info("Loading TCGA-BRCA mutations...")
     if not TCGA_MUTATIONS_MAF.exists():
-        logger.warning(f"Not found: {TCGA_MUTATIONS_MAF}")
+        logger.warning(f"  [TCGA-BRCA] Not found: {TCGA_MUTATIONS_MAF}")
         return []
     df = _std_cols(_read_maf(TCGA_MUTATIONS_MAF))
     if "t_alt" in df.columns and "t_depth" in df.columns:
@@ -91,16 +91,16 @@ def load_tcga_mutations(conn: Connection) -> list[dict[str, Any]]:
             in_metabric_panel=1 if gene in METABRIC_PANEL_GENES else 0,
         ))
     if skip:
-        logger.warning(f"  Skipped {skip} (no matching tumor)")
+        logger.warning(f"  [TCGA-BRCA] Skipped {skip:,} (no matching tumor)")
     panel_n = sum(1 for x in rows if x["in_metabric_panel"])
-    logger.info(f"  TCGA: {len(rows)} mutations ({panel_n} in METABRIC panel)")
+    logger.info(f"  [TCGA-BRCA] {len(rows):,} mutations ({panel_n:,} in METABRIC panel)")
     return rows
 
 
 def load_metabric_mutations(conn: Connection) -> list[dict[str, Any]]:
     logger.info("Loading METABRIC mutations...")
     if not METABRIC_MUTATIONS.exists():
-        logger.warning(f"Not found: {METABRIC_MUTATIONS}")
+        logger.warning(f"  [METABRIC] Not found: {METABRIC_MUTATIONS}")
         return []
     df = _std_cols(_read_maf(METABRIC_MUTATIONS))
     tumors = _tumor_ids(conn)
@@ -126,8 +126,8 @@ def load_metabric_mutations(conn: Connection) -> list[dict[str, Any]]:
             vaf=None, sequencing_scope="PANEL", in_metabric_panel=1,
         ))
     if skip:
-        logger.warning(f"  Skipped {skip} (no matching tumor)")
-    logger.info(f"  METABRIC: {len(rows)} mutations")
+        logger.warning(f"  [METABRIC] Skipped {skip:,} (no matching tumor)")
+    logger.info(f"  [METABRIC] {len(rows):,} mutations")
     return rows
 
 
@@ -144,7 +144,7 @@ def load_mutations() -> None:
                           "Stored as GRCh37. Liftover to GRCh38 needed for coordinate comparisons.",
                           "Start_Position", "Gene-level analysis works without liftover")
         n = conn.execute(text("SELECT count(*) FROM mutations")).scalar()
-        logger.info(f"Mutation load complete: {n} total")
+        logger.info(f"Mutation load complete: {n:,} rows")
 
 
 if __name__ == "__main__":
