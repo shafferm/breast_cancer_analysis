@@ -41,6 +41,13 @@ CDR_FALLBACK = (
 )
 CDR_FILENAME = "TCGA-CDR-SupplementalTableS1.xlsx"
 
+PANCAN_SUBTYPES_URL = "https://pancanatlas.xenahubs.net/download/TCGASubtype.20170308.tsv.gz"
+PANCAN_SUBTYPES_FILENAME = "TCGASubtype.20170308.tsv"
+
+GDC_CLINICAL_ARCHIVE_URL = "https://api.gdc.cancer.gov/data/6321c2d3-09c3-4cbe-8dc6-4b90649aea07"
+GDC_CLINICAL_DRUG_FILENAME = "nationwidechildrens.org_clinical_drug_public_brca.txt"
+GDC_CLINICAL_RADIATION_FILENAME = "nationwidechildrens.org_clinical_radiation_public_brca.txt"
+
 # ---------------------------------------------------------------------------
 # Files expected after extraction (used for validation warnings)
 # ---------------------------------------------------------------------------
@@ -171,6 +178,8 @@ def download_tcga(force: bool = False) -> None:
         _validate(TCGA_DIR, TCGA_EXPECTED, "TCGA-BRCA")
 
     download_cdr(force=force)
+    download_pancan_subtypes(force=force)
+    download_gdc_clinical(force=force)
     logger.info("TCGA-BRCA download complete.")
 
 
@@ -195,6 +204,56 @@ def download_cdr(force: bool = False) -> None:
         _download(CDR_FALLBACK, dest, "CDR (mirror)")
 
     logger.info(f"  CDR file saved to {dest}")
+
+
+def download_pancan_subtypes(force: bool = False) -> None:
+    """Download PanCanAtlas molecular subtypes (includes PAM50 for BRCA)."""
+    import gzip
+    dest = TCGA_DIR / PANCAN_SUBTYPES_FILENAME
+    if not force and dest.exists():
+        logger.info(f"  PanCanAtlas subtypes already present at {dest} — skipping.")
+        return
+
+    TCGA_DIR.mkdir(parents=True, exist_ok=True)
+    gz_dest = dest.parent / (dest.name + ".gz")
+    try:
+        _download(PANCAN_SUBTYPES_URL, gz_dest, "PanCanAtlas subtypes")
+        with gzip.open(gz_dest, "rb") as f_in, open(dest, "wb") as f_out:
+            f_out.write(f_in.read())
+        logger.info(f"  PanCanAtlas subtypes decompressed to {dest}")
+    finally:
+        gz_dest.unlink(missing_ok=True)
+
+
+def download_gdc_clinical(force: bool = False) -> None:
+    """Download GDC BRCA 2012 clinical archive (drug + radiation biotab files)."""
+    drug_dest = TCGA_DIR / GDC_CLINICAL_DRUG_FILENAME
+    rad_dest = TCGA_DIR / GDC_CLINICAL_RADIATION_FILENAME
+    if not force and drug_dest.exists() and rad_dest.exists():
+        logger.info("  GDC clinical files already present — skipping.")
+        return
+
+    TCGA_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        _download(GDC_CLINICAL_ARCHIVE_URL, tmp_path, "GDC clinical archive")
+        with tarfile.open(tmp_path) as tf:
+            for member in tf.getmembers():
+                basename = Path(member.name).name
+                if basename in (GDC_CLINICAL_DRUG_FILENAME, GDC_CLINICAL_RADIATION_FILENAME):
+                    member.name = basename
+                    tf.extract(member, TCGA_DIR)
+                    logger.info(f"  Extracted {basename}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    for dest, label in [(drug_dest, "drug"), (rad_dest, "radiation")]:
+        if dest.exists():
+            logger.info(f"  GDC {label} file: {dest}")
+        else:
+            logger.warning(f"  GDC {label} file not found in archive")
 
 
 # ---------------------------------------------------------------------------

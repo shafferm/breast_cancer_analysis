@@ -10,8 +10,6 @@ import sys
 import tarfile
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import etl._bootstrap  # noqa: F401
@@ -180,7 +178,7 @@ class TestDownloadCdr:
         assert len(urls_called) == 1  # no fallback needed
 
     def test_falls_back_if_too_small(self, tmp_path, monkeypatch):
-        tcga_dir = self._patch_tcga_dir(monkeypatch, tmp_path)
+        self._patch_tcga_dir(monkeypatch, tmp_path)
         urls_called = []
 
         def fake_urlretrieve(url, path, reporthook=None):
@@ -281,6 +279,10 @@ class TestDownloadIdempotency:
                             lambda *a, **kw: calls.append(a))
         monkeypatch.setattr("etl.download_data.download_cdr",
                             lambda force=False: None)
+        monkeypatch.setattr("etl.download_data.download_pancan_subtypes",
+                            lambda force=False: None)
+        monkeypatch.setattr("etl.download_data.download_gdc_clinical",
+                            lambda force=False: None)
 
         download_tcga(force=False)
         assert len(calls) == 0
@@ -298,6 +300,10 @@ class TestDownloadIdempotency:
         monkeypatch.setattr("etl.download_data._extract_tarball",
                             lambda *a, **kw: None)
         monkeypatch.setattr("etl.download_data.download_cdr",
+                            lambda force=False: None)
+        monkeypatch.setattr("etl.download_data.download_pancan_subtypes",
+                            lambda force=False: None)
+        monkeypatch.setattr("etl.download_data.download_gdc_clinical",
                             lambda force=False: None)
 
         download_tcga(force=False)

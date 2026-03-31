@@ -98,6 +98,23 @@ def infer_menopausal_status(age: float | None) -> str:
     return "Pre" if a < MENOPAUSE_AGE_CUTOFF else "Post"
 
 
+def normalize_menopause_status(raw: str) -> str | None:
+    """Map verbose cBioPortal MENOPAUSE_STATUS strings to Pre/Post/Peri/Unknown."""
+    s = clean_value(raw)
+    if s is None:
+        return None
+    key = s.lower()
+    if key.startswith("pre"):
+        return "Pre"
+    if key.startswith("post"):
+        return "Post"
+    if key.startswith("peri"):
+        return "Peri"
+    if key.startswith("indeterminate"):
+        return "Unknown"
+    return "Unknown"
+
+
 def normalize_vital_status(raw: str) -> Optional[str]:
     s = clean_value(raw)
     if s is None:

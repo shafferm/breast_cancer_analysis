@@ -4,8 +4,10 @@ METABRIC targeted sequencing panel: ~173 cancer-related genes.
 Source: Pereira et al., Nat Commun 2016 (Supplementary Table).
 The somatic mutation profiles of 2,433 breast cancers.
 
-This list is used to flag TCGA mutations that fall within the METABRIC
-panel for valid cross-study mutation frequency comparisons.
+NOTE: This hardcoded list is a fallback. The preferred approach is to
+derive the panel gene set from the actual METABRIC mutation data file,
+which contains 173 unique genes — only 59 of which overlap with this list.
+See load_mutations.py for the data-driven derivation.
 """
 
 METABRIC_PANEL_GENES = frozenset([

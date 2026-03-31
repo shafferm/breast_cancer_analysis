@@ -46,11 +46,13 @@ def _std_cols(df: pl.DataFrame) -> pl.DataFrame:
 VALID_VTYPES = {"SNP", "INS", "DEL", "DNP", "TNP", "ONP"}
 
 
-def load_tcga_mutations(conn: Connection) -> list[dict[str, Any]]:
+def load_tcga_mutations(conn: Connection, panel_genes: frozenset[str] | None = None) -> list[dict[str, Any]]:
     logger.info("Loading TCGA-BRCA mutations...")
     if not TCGA_MUTATIONS_MAF.exists():
         logger.warning(f"  [TCGA-BRCA] Not found: {TCGA_MUTATIONS_MAF}")
         return []
+    if panel_genes is None:
+        panel_genes = METABRIC_PANEL_GENES
     df = _std_cols(_read_maf(TCGA_MUTATIONS_MAF))
     if "t_alt" in df.columns and "t_depth" in df.columns:
         df = df.with_columns(
@@ -88,7 +90,7 @@ def load_tcga_mutations(conn: Connection) -> list[dict[str, Any]]:
             variant_type=vt if vt in VALID_VTYPES else None,
             hgvsp=clean_value(r.get("hgvsp")) or clean_value(r.get("hgvsp_long")),
             vaf=clean_float(r.get("vaf")), sequencing_scope="WES",
-            in_metabric_panel=1 if gene in METABRIC_PANEL_GENES else 0,
+            in_metabric_panel=1 if gene in panel_genes else 0,
         ))
     if skip:
         logger.warning(f"  [TCGA-BRCA] Skipped {skip:,} (no matching tumor)")
@@ -131,14 +133,41 @@ def load_metabric_mutations(conn: Connection) -> list[dict[str, Any]]:
     return rows
 
 
+def _derive_metabric_panel_genes() -> frozenset[str]:
+    """Derive the actual METABRIC panel gene set from the mutation data file.
+
+    Falls back to the hardcoded list if the file is unavailable.
+    """
+    if not METABRIC_MUTATIONS.exists():
+        logger.info("  METABRIC mutations file not found; using hardcoded panel gene list")
+        return METABRIC_PANEL_GENES
+    df = pl.read_csv(METABRIC_MUTATIONS, separator="\t", comment_prefix="#",
+                     columns=["Hugo_Symbol"], infer_schema_length=0)
+    genes = frozenset(df["Hugo_Symbol"].drop_nulls().unique().to_list())
+    if not genes:
+        return METABRIC_PANEL_GENES
+    logger.info(f"  Derived {len(genes)} panel genes from METABRIC mutation data")
+    return genes
+
+
 def load_mutations() -> None:
     with get_connection() as conn:
-        for loader in [load_tcga_mutations, load_metabric_mutations]:
-            muts = loader(conn)
-            if muts:
-                bulk_insert(conn, "mutations", muts)
+        # Derive panel genes from actual METABRIC data before loading
+        panel_genes = _derive_metabric_panel_genes()
+
+        # Load METABRIC first (all in_metabric_panel=1 by definition)
+        mb_muts = load_metabric_mutations(conn)
+        if mb_muts:
+            bulk_insert(conn, "mutations", mb_muts)
+
+        # Load TCGA with data-derived panel gene set
+        tcga_muts = load_tcga_mutations(conn, panel_genes=panel_genes)
+        if tcga_muts:
+            bulk_insert(conn, "mutations", tcga_muts)
+
         log_harmonization(conn, "mutations", "BOTH", "in_metabric_panel",
-                          f"TCGA mutations flagged against {len(METABRIC_PANEL_GENES)}-gene panel list",
+                          f"TCGA mutations flagged against {len(panel_genes)}-gene panel "
+                          f"derived from METABRIC mutation data",
                           "Hugo_Symbol", "Use WHERE in_metabric_panel=1 for cross-study comparisons")
         log_harmonization(conn, "mutations", "METABRIC", "reference_genome",
                           "Stored as GRCh37. Liftover to GRCh38 needed for coordinate comparisons.",

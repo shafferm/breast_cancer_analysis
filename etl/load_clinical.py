@@ -15,6 +15,8 @@ from sqlalchemy.engine import Connection
 import etl._bootstrap  # noqa: F401
 from config.settings import (
     TCGA_CDR_FILE, TCGA_CLINICAL_PATIENT, TCGA_CLINICAL_DRUG,
+    TCGA_CLINICAL_CBIO, TCGA_PANCAN_SUBTYPES,
+    TCGA_CLINICAL_DRUG_GDC, TCGA_CLINICAL_RADIATION_GDC,
     METABRIC_CLINICAL_PATIENT, METABRIC_CLINICAL_SAMPLE,
 )
 from etl.db import get_connection, bulk_insert, log_harmonization
@@ -22,7 +24,7 @@ from etl.harmonize import (
     clean_value, clean_float, clean_int, days_to_months,
     normalize_pam50, normalize_receptor_status, normalize_vital_status,
     normalize_stage, normalize_histology, derive_tnbc,
-    infer_menopausal_status, compute_npi,
+    infer_menopausal_status, normalize_menopause_status, compute_npi,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -31,6 +33,53 @@ logger = logging.getLogger(__name__)
 
 def read_cbioportal_file(path: Path) -> pl.DataFrame:
     return pl.read_csv(path, separator="\t", comment_prefix="#", infer_schema_length=0)
+
+
+# ---- TCGA supplementary lookups ----
+
+def _load_cbio_clinical_lookup() -> dict[str, dict[str, Any]]:
+    """Build {patient_id: {...}} from cBioPortal clinical patient file.
+
+    Extracts receptor status, HER2 FISH, ethnicity, menopause, lymph node
+    counts, and surgery info for supplementing CDR data.
+    """
+    if not TCGA_CLINICAL_CBIO.exists():
+        return {}
+    df = read_cbioportal_file(TCGA_CLINICAL_CBIO)
+    lookup: dict[str, dict[str, Any]] = {}
+    for r in df.to_dicts():
+        pid = clean_value(r.get("PATIENT_ID"))
+        if not pid:
+            continue
+        lookup[pid] = {
+            "er": normalize_receptor_status(r.get("ER_STATUS_BY_IHC", "")),
+            "pr": normalize_receptor_status(r.get("PR_STATUS_BY_IHC", "")),
+            "her2": normalize_receptor_status(r.get("IHC_HER2", "")),
+            "her2_fish": normalize_receptor_status(r.get("HER2_FISH_STATUS", "")),
+            "ethnicity": clean_value(r.get("ETHNICITY")),
+            "menopause": normalize_menopause_status(r.get("MENOPAUSE_STATUS", "")),
+            "nodes_examined": clean_int(r.get("LYMPH_NODE_EXAMINED_COUNT")),
+            "nodes_positive": clean_int(r.get("LYMPH_NODES_EXAMINED_HE_COUNT")),
+            "surgery": clean_value(r.get("SURGICAL_PROCEDURE_FIRST")),
+        }
+    return lookup
+
+
+def _load_pancan_pam50_lookup() -> dict[str, str]:
+    """Build {patient_id: pam50_subtype} from PanCanAtlas subtype file."""
+    if not TCGA_PANCAN_SUBTYPES.exists():
+        return {}
+    df = pl.read_csv(TCGA_PANCAN_SUBTYPES, separator="\t", infer_schema_length=0)
+    df = df.filter(pl.col("Subtype_Selected").str.starts_with("BRCA."))
+    lookup: dict[str, str] = {}
+    for r in df.to_dicts():
+        sample_id = r.get("sampleID", "")
+        # Extract patient_id from TCGA barcode (first 12 chars: TCGA-XX-XXXX)
+        pid = "-".join(sample_id.split("-")[:3])
+        pam50 = normalize_pam50(r.get("Subtype_mRNA", ""))
+        if pid and pam50 != "Unknown":
+            lookup[pid] = pam50
+    return lookup
 
 
 # ---- TCGA ----
@@ -45,6 +94,14 @@ def load_tcga_clinical_cdr(conn: Connection) -> tuple[list[dict[str, Any]], list
     df = df.filter(pl.col("type") == "BRCA")
     logger.info(f"  [TCGA-BRCA] {len(df):,} cases in CDR")
 
+    # Load supplementary data from cBioPortal and PanCanAtlas
+    cbio_lookup = _load_cbio_clinical_lookup()
+    pam50_lookup = _load_pancan_pam50_lookup()
+    if cbio_lookup:
+        logger.info(f"  [TCGA-BRCA] Loaded clinical data for {len(cbio_lookup):,} patients from cBioPortal")
+    if pam50_lookup:
+        logger.info(f"  [TCGA-BRCA] Loaded PAM50 subtypes for {len(pam50_lookup):,} patients from PanCanAtlas")
+
     patients, tumors = [], []
     for r in df.to_dicts():
         pid = clean_value(r.get("bcr_patient_barcode"))
@@ -53,13 +110,41 @@ def load_tcga_clinical_cdr(conn: Connection) -> tuple[list[dict[str, Any]], list
         age = clean_float(r.get("age_at_initial_pathologic_diagnosis"))
         os_ev = clean_int(r.get("OS"))
         vital = {1: "Deceased", 0: "Alive"}.get(os_ev)
+        cbio = cbio_lookup.get(pid, {})
+
+        # Receptor status: try CDR first, fall back to cBioPortal
         er = normalize_receptor_status(r.get("er_status_by_ihc", ""))
         pr = normalize_receptor_status(r.get("pr_status_by_ihc", ""))
         her2 = normalize_receptor_status(r.get("her2_status_by_ihc", ""))
+        if er == "Unknown":
+            er = cbio.get("er", "Unknown")
+        if pr == "Unknown":
+            pr = cbio.get("pr", "Unknown")
+        if her2 == "Unknown":
+            her2 = cbio.get("her2", "Unknown")
+        # Resolve HER2 Equivocal via FISH
+        if her2 == "Equivocal":
+            fish = cbio.get("her2_fish", "Unknown")
+            if fish in ("Positive", "Negative"):
+                her2 = fish
+
+        # PAM50: try CDR first, fall back to PanCanAtlas
+        pam50 = normalize_pam50(r.get("paper_BRCA_Subtype_PAM50", ""))
+        if pam50 == "Unknown" and pid in pam50_lookup:
+            pam50 = pam50_lookup[pid]
+
+        # Ethnicity: CDR then cBioPortal
+        ethnicity = clean_value(r.get("ethnicity")) or cbio.get("ethnicity")
+        # Menopause: prefer clinical cBioPortal over age-heuristic
+        menopause = cbio.get("menopause") or infer_menopausal_status(age)
+        # Lymph nodes from cBioPortal
+        nodes_examined = cbio.get("nodes_examined")
+        nodes_positive = cbio.get("nodes_positive")
+
         patients.append(dict(
             patient_id=pid, study_source="TCGA-BRCA", age_at_diagnosis=age, sex="F",
-            race=clean_value(r.get("race")), ethnicity=clean_value(r.get("ethnicity")),
-            menopausal_status=infer_menopausal_status(age), vital_status=vital,
+            race=clean_value(r.get("race")), ethnicity=ethnicity,
+            menopausal_status=menopause, vital_status=vital,
             os_months=days_to_months(r.get("OS.time")), os_event=os_ev,
             dfs_months=days_to_months(r.get("PFI.time")), dfs_event=clean_int(r.get("PFI")),
         ))
@@ -68,12 +153,13 @@ def load_tcga_clinical_cdr(conn: Connection) -> tuple[list[dict[str, Any]], list
             histological_type=normalize_histology(r.get("histological_type", "")),
             tumor_grade=clean_int(r.get("neoplasm_histologic_grade")),
             tumor_stage=normalize_stage(r.get("ajcc_pathologic_tumor_stage", "")),
-            tumor_size_cm=None, lymph_nodes_positive=None, lymph_nodes_examined=None,
+            tumor_size_cm=None, lymph_nodes_positive=nodes_positive,
+            lymph_nodes_examined=nodes_examined,
             er_status=er, pr_status=pr, her2_status=her2, tnbc_status=derive_tnbc(er, pr, her2),
-            pam50_subtype=normalize_pam50(r.get("paper_BRCA_Subtype_PAM50", "")),
+            pam50_subtype=pam50,
             integrative_cluster=None, nottingham_prognostic_index=None,
         ))
-    tx = _load_tcga_treatments({p["patient_id"] for p in patients})
+    tx = _load_tcga_treatments({p["patient_id"] for p in patients}, cbio_lookup)
     logger.info(f"  [TCGA-BRCA] {len(patients):,} patients, {len(tumors):,} tumors, {len(tx):,} treatments")
     return patients, tumors, tx
 
@@ -119,30 +205,62 @@ def load_tcga_clinical_biotab(conn: Connection) -> tuple[list[dict[str, Any]], l
             pam50_subtype="Unknown", integrative_cluster=None,
             nottingham_prognostic_index=compute_npi(sz, gr, ln),
         ))
-    tx = _load_tcga_treatments({p["patient_id"] for p in patients})
+    tx = _load_tcga_treatments({p["patient_id"] for p in patients}, {})
     logger.info(f"  [TCGA-BRCA] {len(patients):,} patients, {len(tumors):,} tumors, {len(tx):,} treatments")
     return patients, tumors, tx
 
 
-def _load_tcga_treatments(pids: set[str]) -> list[dict[str, Any]]:
-    if not TCGA_CLINICAL_DRUG.exists():
-        return []
-    df = pl.read_csv(TCGA_CLINICAL_DRUG, separator="\t", skip_rows_after_header=2,
-                     infer_schema_length=0)
+def _load_tcga_treatments(pids: set[str], cbio_lookup: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     tx_map = {"Chemotherapy": "Chemotherapy", "Hormone Therapy": "Hormone Therapy",
               "Targeted Molecular therapy": "Targeted Therapy",
               "Immunotherapy": "Other", "Ancillary": "Other"}
-    out, ctr = [], 0
-    for r in df.to_dicts():
-        pid = clean_value(r.get("bcr_patient_barcode"))
-        if not pid or pid not in pids:
-            continue
-        ctr += 1
-        out.append(dict(
-            treatment_id=f"TCGA-TX-{ctr:06d}", patient_id=pid,
-            treatment_type=tx_map.get(clean_value(r.get("pharmaceutical_therapy_type", "")), "Other"),
-            treatment_name=clean_value(r.get("pharmaceutical_therapy_drug_name")), received=1,
-        ))
+    out: list[dict[str, Any]] = []
+    ctr = 0
+
+    # 1) GDC drug file (preferred source)
+    drug_path = TCGA_CLINICAL_DRUG_GDC if TCGA_CLINICAL_DRUG_GDC.exists() else TCGA_CLINICAL_DRUG
+    if drug_path.exists():
+        df = pl.read_csv(drug_path, separator="\t", skip_rows_after_header=2,
+                         infer_schema_length=0)
+        for r in df.to_dicts():
+            pid = clean_value(r.get("bcr_patient_barcode"))
+            if not pid or pid not in pids:
+                continue
+            # GDC uses "therapy_type"; biotab uses "pharmaceutical_therapy_type"
+            raw_type = clean_value(r.get("therapy_type") or r.get("pharmaceutical_therapy_type", ""))
+            ctr += 1
+            out.append(dict(
+                treatment_id=f"TCGA-TX-{ctr:06d}", patient_id=pid,
+                treatment_type=tx_map.get(raw_type, "Other"),
+                treatment_name=clean_value(r.get("drug_name") or r.get("pharmaceutical_therapy_drug_name")),
+                received=1,
+            ))
+
+    # 2) GDC radiation file
+    if TCGA_CLINICAL_RADIATION_GDC.exists():
+        df_rad = pl.read_csv(TCGA_CLINICAL_RADIATION_GDC, separator="\t",
+                             skip_rows_after_header=2, infer_schema_length=0)
+        for r in df_rad.to_dicts():
+            pid = clean_value(r.get("bcr_patient_barcode"))
+            if not pid or pid not in pids:
+                continue
+            ctr += 1
+            out.append(dict(
+                treatment_id=f"TCGA-TX-{ctr:06d}", patient_id=pid,
+                treatment_type="Radiation", treatment_name=None, received=1,
+            ))
+
+    # 3) Surgery from cBioPortal clinical patient file
+    for pid in pids:
+        cbio = cbio_lookup.get(pid, {})
+        surgery = cbio.get("surgery")
+        if surgery:
+            ctr += 1
+            out.append(dict(
+                treatment_id=f"TCGA-TX-{ctr:06d}", patient_id=pid,
+                treatment_type="Surgery", treatment_name=surgery, received=1,
+            ))
+
     return out
 
 
@@ -178,8 +296,8 @@ def load_metabric_clinical(conn: Connection) -> tuple[list[dict[str, Any]], list
             os_ev, vital = None, None
         rfs_m = clean_float(r.get("RFS_MONTHS") or r.get("DFS_MONTHS"))
         rfs_raw = str(r.get("RFS_STATUS") or r.get("DFS_STATUS") or "")
-        rfs_ev = 1 if "Recurred" in rfs_raw or rfs_raw.startswith("1") else \
-                 0 if "Not Recurred" in rfs_raw or rfs_raw.startswith("0") else None
+        rfs_ev = 0 if "Not Recurred" in rfs_raw or rfs_raw.startswith("0") else \
+                 1 if "Recurred" in rfs_raw or rfs_raw.startswith("1") else None
 
         meno_raw = clean_value(r.get("INFERRED_MENOPAUSAL_STATE", ""))
         meno = {"Pre": "Pre", "Post": "Post", "pre": "Pre", "post": "Post"}.get(
@@ -195,7 +313,8 @@ def load_metabric_clinical(conn: Connection) -> tuple[list[dict[str, Any]], list
         pr = normalize_receptor_status(r.get("PR_STATUS", ""))
         her2 = normalize_receptor_status(r.get("HER2_STATUS") or r.get("HER2_SNP6") or "")
         sid = clean_value(r.get("SAMPLE_ID") or f"{pid}-T")
-        sz = clean_float(r.get("TUMOR_SIZE"))
+        sz_mm = clean_float(r.get("TUMOR_SIZE"))
+        sz = sz_mm / 10.0 if sz_mm is not None else None
         gr = clean_int(r.get("GRADE") or r.get("TUMOR_GRADE"))
         npi = clean_float(r.get("NOTTINGHAM_PROGNOSTIC_INDEX") or r.get("NPI"))
         ln = clean_int(r.get("LYMPH_NODES_EXAMINED_POSITIVE"))
@@ -240,6 +359,39 @@ def load_clinical() -> None:
                           "CDR OS.time (days) / 30.44", "OS.time", "PFI recommended for BRCA.")
         log_harmonization(conn, "patients", "METABRIC", "os_months",
                           "Used OS_MONTHS directly", "OS_MONTHS", None)
+        log_harmonization(conn, "tumors", "TCGA-BRCA", "er_status",
+                          "Merged from cBioPortal data_clinical_patient.txt (ER_STATUS_BY_IHC) "
+                          "where CDR value was missing",
+                          "ER_STATUS_BY_IHC", "PR and HER2 also merged from same source")
+        log_harmonization(conn, "tumors", "TCGA-BRCA", "pam50_subtype",
+                          "From PanCanAtlas TCGASubtype.20170308.tsv (Hoadley et al. 2018), "
+                          "Subtype_mRNA column",
+                          "Subtype_mRNA", "1,097 BRCA patients classified via UCSC Xena hub")
+        log_harmonization(conn, "patients", "TCGA-BRCA", "ethnicity",
+                          "From cBioPortal data_clinical_patient.txt ETHNICITY column",
+                          "ETHNICITY", None)
+        log_harmonization(conn, "patients", "TCGA-BRCA", "menopausal_status",
+                          "Clinical menopause from cBioPortal MENOPAUSE_STATUS, "
+                          "replacing age-based heuristic",
+                          "MENOPAUSE_STATUS", None)
+        log_harmonization(conn, "tumors", "TCGA-BRCA", "lymph_nodes_examined",
+                          "From cBioPortal LYMPH_NODE_EXAMINED_COUNT and "
+                          "LYMPH_NODES_EXAMINED_HE_COUNT",
+                          "LYMPH_NODE_EXAMINED_COUNT", None)
+        log_harmonization(conn, "tumors", "TCGA-BRCA", "her2_status",
+                          "IHC Equivocal cases resolved using HER2_FISH_STATUS where available",
+                          "HER2_FISH_STATUS", None)
+        log_harmonization(conn, "tumors", "METABRIC", "tumor_size_cm",
+                          "METABRIC TUMOR_SIZE converted from mm to cm (/ 10)",
+                          "TUMOR_SIZE", None)
+        log_harmonization(conn, "patients", "METABRIC", "dfs_event",
+                          "METABRIC RFS_STATUS parsing order fixed "
+                          "(check 'Not Recurred' before 'Recurred')",
+                          "RFS_STATUS", None)
+        log_harmonization(conn, "treatments", "TCGA-BRCA", "treatment_type",
+                          "From GDC biotab clinical archive (drug + radiation) "
+                          "and cBioPortal surgery",
+                          "therapy_type", None)
 
         for t in ["patients", "tumors", "treatments"]:
             n = conn.execute(text(f"SELECT count(*) FROM {t}")).scalar()

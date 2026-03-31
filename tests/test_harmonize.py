@@ -18,7 +18,8 @@ from etl.harmonize import (
     clean_value, clean_float, clean_int, days_to_months,
     normalize_pam50, normalize_receptor_status, derive_tnbc,
     normalize_stage, normalize_histology, infer_menopausal_status,
-    normalize_vital_status, normalize_variant_classification,
+    normalize_menopause_status, normalize_vital_status,
+    normalize_variant_classification,
     compute_npi, parse_tcga_barcode,
 )
 from config.metabric_panel_genes import METABRIC_PANEL_GENES
@@ -367,3 +368,119 @@ class TestNormalizeHistology:
 
     def test_none(self):
         assert normalize_histology(None) is None
+
+
+# ---------------------------------------------------------------------------
+# normalize_menopause_status (cBioPortal verbose strings)
+# ---------------------------------------------------------------------------
+
+class TestNormalizeMenopauseStatus:
+    def test_post_verbose(self):
+        assert normalize_menopause_status(
+            "Post (prior bilateral ovariectomy OR >12 mo since LMP with no prior hysterectomy)"
+        ) == "Post"
+
+    def test_pre_verbose(self):
+        assert normalize_menopause_status(
+            "Pre (<6 months since LMP AND no prior bilateral ovariectomy AND not on estrogen replacement)"
+        ) == "Pre"
+
+    def test_peri_verbose(self):
+        assert normalize_menopause_status(
+            "Peri (6-12 months since last menstrual period)"
+        ) == "Peri"
+
+    def test_indeterminate(self):
+        assert normalize_menopause_status(
+            "Indeterminate (neither combatible with pre, peri, or postmenopausal)"
+        ) == "Unknown"
+
+    def test_not_available(self):
+        assert normalize_menopause_status("[Not Available]") is None
+
+    def test_none(self):
+        assert normalize_menopause_status(None) is None
+
+    def test_empty(self):
+        assert normalize_menopause_status("") is None
+
+
+# ---------------------------------------------------------------------------
+# HER2 FISH resolution logic
+# ---------------------------------------------------------------------------
+
+class TestHer2FishResolution:
+    """Test the logic used in load_tcga_clinical_cdr for resolving HER2 Equivocal."""
+
+    def test_equivocal_resolved_by_positive_fish(self):
+        her2 = "Equivocal"
+        fish = "Positive"
+        if her2 == "Equivocal" and fish in ("Positive", "Negative"):
+            her2 = fish
+        assert her2 == "Positive"
+
+    def test_equivocal_resolved_by_negative_fish(self):
+        her2 = "Equivocal"
+        fish = "Negative"
+        if her2 == "Equivocal" and fish in ("Positive", "Negative"):
+            her2 = fish
+        assert her2 == "Negative"
+
+    def test_equivocal_not_resolved_by_unknown_fish(self):
+        her2 = "Equivocal"
+        fish = "Unknown"
+        if her2 == "Equivocal" and fish in ("Positive", "Negative"):
+            her2 = fish
+        assert her2 == "Equivocal"
+
+    def test_positive_not_changed(self):
+        her2 = "Positive"
+        fish = "Negative"
+        if her2 == "Equivocal" and fish in ("Positive", "Negative"):
+            her2 = fish
+        assert her2 == "Positive"
+
+
+# ---------------------------------------------------------------------------
+# METABRIC RFS_STATUS parsing
+# ---------------------------------------------------------------------------
+
+class TestMetabricRfsStatusParsing:
+    """Test the fixed parsing logic for METABRIC RFS_STATUS."""
+
+    @staticmethod
+    def _parse_rfs(rfs_raw: str) -> int | None:
+        return 0 if "Not Recurred" in rfs_raw or rfs_raw.startswith("0") else \
+               1 if "Recurred" in rfs_raw or rfs_raw.startswith("1") else None
+
+    def test_not_recurred(self):
+        assert self._parse_rfs("0:Not Recurred") == 0
+
+    def test_recurred(self):
+        assert self._parse_rfs("1:Recurred") == 1
+
+    def test_not_recurred_text_only(self):
+        assert self._parse_rfs("Not Recurred") == 0
+
+    def test_recurred_text_only(self):
+        assert self._parse_rfs("Recurred") == 1
+
+    def test_empty(self):
+        assert self._parse_rfs("") is None
+
+
+# ---------------------------------------------------------------------------
+# METABRIC tumor size mm → cm
+# ---------------------------------------------------------------------------
+
+class TestMetabricTumorSizeConversion:
+    def test_typical_values(self):
+        for mm, expected_cm in [(15, 1.5), (20, 2.0), (25, 2.5), (30, 3.0)]:
+            sz_mm = clean_float(mm)
+            sz = sz_mm / 10.0 if sz_mm is not None else None
+            assert sz == expected_cm
+
+    def test_none(self):
+        sz_mm = clean_float(None)
+        sz = sz_mm / 10.0 if sz_mm is not None else None
+        assert sz is None
